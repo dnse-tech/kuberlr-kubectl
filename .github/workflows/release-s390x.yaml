@@ -1,0 +1,117 @@
+# Hardened s390x + multi-arch release for dnse-tech/kuberlr-kubectl.
+# Invariants: workflow_dispatch-only (no push/release double-fire); upstream legs digest-pinned
+# dynamically (amd64/arm64 digests resolved at runtime, combined by digest — never hardcoded).
+# Builds linux/s390x, pushes :<tag>-s390x, then combines upstream amd64/arm64 + our s390x → :<tag>.
+#
+# The Dockerfile is arch-agnostic: every layer it pulls (ghcr.io/flavio/kuberlr, SUSE bci-busybox,
+# bci-base) publishes an s390x leg, and `kuberlr get` fetches linux/s390x kubectl from dl.k8s.io with
+# its own hash verification. No s390x patch is needed — build the stock package/Dockerfile under QEMU.
+#
+# Reference copy mirrored in rancher-mirror/templates/rancher-app/; authoritative copy lives on the
+# fork's default branch as .github/workflows/release-s390x.yaml.
+name: Build s390x and Multi-Arch Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g., v7.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/kuberlr-kubectl
+  UPSTREAM_IMAGE: rancher/kuberlr-kubectl
+
+jobs:
+  build-s390x:
+    name: Build s390x image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ inputs.tag }}
+    steps:
+      - name: Checkout repository at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push s390x image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: package/Dockerfile
+          platforms: linux/s390x
+          push: true
+          build-args: |
+            VERSION=${{ inputs.tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}-s390x
+
+  create-manifest:
+    name: Create multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: build-s390x
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve upstream leg digests (supply-chain pin)
+        id: legs
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-s390x.outputs.version }}"
+          UPSTREAM="${{ env.UPSTREAM_IMAGE }}:${TAG}"
+          RAW="$(docker buildx imagetools inspect --raw "$UPSTREAM")" \
+            || { echo "::error::upstream $UPSTREAM not found"; exit 1; }
+          AMD64="$(printf '%s' "$RAW" | jq -r '.manifests[]?|select(.platform.os=="linux" and .platform.architecture=="amd64").digest' | head -1)"
+          ARM64="$(printf '%s' "$RAW" | jq -r '.manifests[]?|select(.platform.os=="linux" and .platform.architecture=="arm64").digest' | head -1)"
+          [ -n "$AMD64" ] && [ -n "$ARM64" ] || { echo "::error::upstream missing amd64/arm64 (amd64=$AMD64 arm64=$ARM64)"; exit 1; }
+          echo "amd64=$AMD64" >> "$GITHUB_OUTPUT"
+          echo "arm64=$ARM64" >> "$GITHUB_OUTPUT"
+          echo "upstream legs: amd64=$AMD64 arm64=$ARM64"
+
+      - name: Create and push digest-pinned multi-arch manifest
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-s390x.outputs.version }}"
+          UPSTREAM="${{ env.UPSTREAM_IMAGE }}"
+          TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker buildx imagetools create -t "${TARGET}:${TAG}" \
+            "${TARGET}:${TAG}-s390x" \
+            "${UPSTREAM}@${{ steps.legs.outputs.amd64 }}" \
+            "${UPSTREAM}@${{ steps.legs.outputs.arm64 }}"
+          echo "Pushed multi-arch: ${TARGET}:${TAG}"
+
+      - name: Verify manifest
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-s390x.outputs.version }}"
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
